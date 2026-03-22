@@ -120,16 +120,12 @@ server admins can import existing generated chunks into voxy storage with the fo
 
 - `/voxyserver import existing all`  
   imports all loaded dimensions that have a `region` folder
-
 - `/voxyserver import existing current`  
   imports the current dimension of the executing player
-
 - `/voxyserver import existing dimension <dimension>`  
   imports a specific loaded dimension, for example `minecraft:overworld`
-
 - `/voxyserver import existing status`  
   shows the current import status
-
 - `/voxyserver import existing cancel`  
   cancels the active import job
 
