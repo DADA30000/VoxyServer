@@ -24,6 +24,9 @@ public class ServerLodEngine extends VoxyInstance {
 
     @Override
     protected SectionStorage createStorage(WorldIdentifier identifier) {
+        if (com.dripps.voxyserver.util.ServerStatsTracker.INSTANCE != null) {
+            com.dripps.voxyserver.util.ServerStatsTracker.INSTANCE.markEngineAction();
+        }
         var ctx = new ConfigBuildCtx();
         ctx.setProperty(ConfigBuildCtx.BASE_SAVE_PATH, this.basePath.toString());
         ctx.setProperty(ConfigBuildCtx.WORLD_IDENTIFIER, identifier.getWorldId());

@@ -19,6 +19,8 @@ public class VoxyServerConfig {
     public int tickInterval = 5;
     public boolean dirtyTrackingEnabled = true;
     public int dirtyTrackingInterval = 40;
+    public boolean debugTrackingEnabled = false;
+    public int debugTrackingInterval = 200;
 
     public static VoxyServerConfig load() {
         Path configPath = FabricLoader.getInstance().getConfigDir().resolve(FILE_NAME);

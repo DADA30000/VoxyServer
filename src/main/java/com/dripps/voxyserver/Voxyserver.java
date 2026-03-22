@@ -6,7 +6,11 @@ import com.dripps.voxyserver.server.ChunkVoxelizer;
 import com.dripps.voxyserver.server.DirtyTracker;
 import com.dripps.voxyserver.server.LodStreamingService;
 import com.dripps.voxyserver.server.ServerLodEngine;
+import com.dripps.voxyserver.server.VoxyServerCommands;
+import com.dripps.voxyserver.server.WorldImportCoordinator;
+import com.dripps.voxyserver.util.VoxyUpdateChecker;
 import net.fabricmc.api.ModInitializer;
+import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
 import net.fabricmc.fabric.api.entity.event.v1.ServerEntityWorldChangeEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
@@ -22,6 +26,7 @@ public class Voxyserver implements ModInitializer {
     private ServerLodEngine lodEngine;
     private ChunkVoxelizer chunkVoxelizer;
     private LodStreamingService streamingService;
+    private WorldImportCoordinator importCoordinator;
     private DirtyTracker dirtyTracker;
 
     public static VoxyServerConfig getConfig() {
@@ -33,7 +38,9 @@ public class Voxyserver implements ModInitializer {
         config = VoxyServerConfig.load();
         LOGGER.info("VoxyServer initialized");
         VoxyServerNetworking.register();
-
+        VoxyUpdateChecker.checkForUpdates();
+        CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) ->
+                VoxyServerCommands.register(dispatcher, () -> importCoordinator));
         ServerLifecycleEvents.SERVER_STARTED.register(server -> {
             var worldPath = server.getWorldPath(LevelResource.ROOT);
             lodEngine = new ServerLodEngine(worldPath);
@@ -41,10 +48,15 @@ public class Voxyserver implements ModInitializer {
             chunkVoxelizer.register();
             streamingService = new LodStreamingService(lodEngine, config);
             streamingService.register();
+            importCoordinator = new WorldImportCoordinator(lodEngine, streamingService);
             if (config.dirtyTrackingEnabled) {
                 dirtyTracker = new DirtyTracker(chunkVoxelizer, streamingService, config.dirtyTrackingInterval);
                 DirtyTracker.INSTANCE = dirtyTracker;
                 ServerTickEvents.END_SERVER_TICK.register(dirtyTracker::tick);
+            }
+            if (config.debugTrackingEnabled) {
+                com.dripps.voxyserver.util.ServerStatsTracker.INSTANCE = new com.dripps.voxyserver.util.ServerStatsTracker(config.debugTrackingInterval);
+                ServerTickEvents.END_SERVER_TICK.register(com.dripps.voxyserver.util.ServerStatsTracker.INSTANCE::tick);
             }
             LOGGER.info("VoxyServer engine started for world: {}", worldPath);
         });
@@ -54,11 +66,13 @@ public class Voxyserver implements ModInitializer {
                 LOGGER.info("shutting down VoxyServer engine");
                 DirtyTracker.INSTANCE = null;
                 dirtyTracker = null;
+                if (importCoordinator != null) importCoordinator.shutdown();
                 if (streamingService != null) streamingService.shutdown();
                 lodEngine.shutdown();
                 lodEngine = null;
                 chunkVoxelizer = null;
                 streamingService = null;
+                importCoordinator = null;
             }
         });
 

@@ -8,7 +8,9 @@ a fabric server side mod that voxelizes chunks into LODs using [voxy](https://gi
 
 when chunks load on the server, they get voxelized into voxy's LOD format and stored in a per world database. when a player with voxy connects, the server streams LOD sections to them in a spiral outward from their position. as the player moves, new sections are sent automatically.
 
-block changes (building, explosions, etc) are detected and the affected LOD sections are revoxelized and pushed to nearby players automatically.
+block changes (building, explosions, etc) are detected and the affected LOD sections are revoxelized and pushed to clients automatically.
+
+existing worlds can also be backfilled from their region files with an admin command, so already explored terrain can be voxelized without needing players to revisit it chunk by chunk.
 
 players without voxy are unaffected.
 
@@ -92,6 +94,8 @@ config file is generated at `config/voxyserver.json` on first run.
 | `generateOnChunkLoad` | `true` | voxelize chunks as they load on the server |
 | `dirtyTrackingEnabled` | `true` | revoxelize and push LODs when blocks change |
 | `dirtyTrackingInterval` | `40` | ticks between dirty chunk flushes (40 = 2 seconds) |
+| `debugTrackingEnabled` | `false` | output internal server stats to the console periodically |
+| `debugTrackingInterval` | `200` | ticks between dumping tracking stats (200 = 10 seconds) |
 
 ### example config
 
@@ -102,11 +106,34 @@ config file is generated at `config/voxyserver.json` on first run.
   "generateOnChunkLoad": true,
   "tickInterval": 5,
   "dirtyTrackingEnabled": true,
-  "dirtyTrackingInterval": 40
+  "dirtyTrackingInterval": 40,
+  "debugTrackingEnabled": false,
+  "debugTrackingInterval": 200
 }
 ```
 
 higher `lodStreamRadius` means more LOD coverage but more storage and bandwidth. `maxSectionsPerTickPerPlayer` controls how fast LODs are sent to new players or when moving into unexplored areas. lower `tickInterval` = more frequent streaming checks.
+
+## commands
+
+server admins can import existing generated chunks into voxy storage with the following commands:
+
+- `/voxyserver import existing all`  
+  imports all loaded dimensions that have a `region` folder
+
+- `/voxyserver import existing current`  
+  imports the current dimension of the executing player
+
+- `/voxyserver import existing dimension <dimension>`  
+  imports a specific loaded dimension, for example `minecraft:overworld`
+
+- `/voxyserver import existing status`  
+  shows the current import status
+
+- `/voxyserver import existing cancel`  
+  cancels the active import job
+
+imports run sequentially and read existing `region/*.mca` files directly, which is much faster than waiting for chunks to be loaded normally. imported dimensions are refreshed for connected voxy clients automatically once the import completes.
 
 ## storage
 

@@ -38,6 +38,10 @@ public class ChunkVoxelizer {
         WorldEngine world = engine.getOrCreate(worldId);
         if (world == null) return;
 
+        if (com.dripps.voxyserver.util.ServerStatsTracker.INSTANCE != null) {
+            com.dripps.voxyserver.util.ServerStatsTracker.INSTANCE.markVoxelized();
+        }
+
         engine.getIngestService().enqueueIngest(world, chunk);
     }
 

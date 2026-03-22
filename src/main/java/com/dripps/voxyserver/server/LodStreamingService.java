@@ -139,6 +139,9 @@ public class LodStreamingService {
             if (tracker == null || !tracker.isReady()) continue;
 
             try {
+                if (com.dripps.voxyserver.util.ServerStatsTracker.INSTANCE != null) {
+                    com.dripps.voxyserver.util.ServerStatsTracker.INSTANCE.markStreamed();
+                }
                 streamForSnapshot(server, snap, tracker);
             } catch (Exception e) {
                 Voxyserver.LOGGER.error("error streaming LODs for player {}", snap.uuid, e);
@@ -185,6 +188,9 @@ public class LodStreamingService {
                     if (!tracker.isReady() || !tracker.hasSent(sectionKey)) continue;
 
                     UUID playerId = entry.getKey();
+                    if (com.dripps.voxyserver.util.ServerStatsTracker.INSTANCE != null) {
+                        com.dripps.voxyserver.util.ServerStatsTracker.INSTANCE.markStreamed();
+                    }
                     server.execute(() -> {
                         ServerPlayer player = server.getPlayerList().getPlayer(playerId);
                         if (player != null) {
@@ -203,6 +209,20 @@ public class LodStreamingService {
         tracker.reset();
         Identifier dim = newLevel.dimension().identifier();
         ServerPlayNetworking.send(player, LODClearPayload.clearDimension(dim));
+    }
+
+    public void clearDimensionForReadyPlayers(ServerLevel level) {
+        Identifier dim = level.dimension().identifier();
+        for (var entry : trackers.entrySet()) {
+            PlayerLodTracker tracker = entry.getValue();
+            if (tracker == null || !tracker.isReady()) continue;
+
+            ServerPlayer player = level.getServer().getPlayerList().getPlayer(entry.getKey());
+            if (player == null || player.level() != level) continue;
+
+            tracker.reset();
+            ServerPlayNetworking.send(player, LODClearPayload.clearDimension(dim));
+        }
     }
 
     private void streamForSnapshot(MinecraftServer server, PlayerSnapshot snap, PlayerLodTracker tracker) {
