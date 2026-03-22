@@ -16,29 +16,63 @@ players without voxy are unaffected.
 
 due to voxy's license, the source and binary can't be included in this repo. you'll need to clone and build it yourself.
 
+### unix
+
 1. clone voxy into the root of this project:
-   ```
+   ```bash
    git clone https://github.com/MCRcortex/voxy.git
    ```
 
 2. build the voxy jar:
-   ```
+   ```bash
    cd voxy
    ./gradlew build
    ```
 
-3. copy the built voxy jar to `libs/`:
-   ```
+3. go back to the project root, make the `libs` directory, and copy the built jar:
+   ```bash
+   cd ..
    mkdir libs
    cp voxy/build/libs/voxy-*.jar libs/voxy.jar
    ```
 
 4. build voxyserver:
-   ```
+   ```bash
    ./gradlew build
    ```
 
 the output jar will be in `build/libs/`.
+
+---
+
+### windows
+
+*note: please use command prompt (cmd) for these commands, not powershell.*
+
+1. clone voxy into the root of this project:
+   ```cmd
+   git clone https://github.com/MCRcortex/voxy.git
+   ```
+
+2. build the voxy jar:
+   ```cmd
+   cd voxy
+   gradlew build
+   ```
+
+3. go back to the project root, make the `libs` directory, and copy the built jar:
+   ```cmd
+   cd ..
+   mkdir libs
+   for %f in (voxy\build\libs\voxy-*.jar) do copy "%f" libs\voxy.jar
+   ```
+
+4. build voxyserver:
+   ```cmd
+   gradlew build
+   ```
+
+the output jar will be in `build\libs\`.
 
 ## installation
 
