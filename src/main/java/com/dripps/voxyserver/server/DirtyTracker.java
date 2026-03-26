@@ -15,15 +15,15 @@ public class DirtyTracker {
     private static final int PUSH_DELAY_TICKS = 2;
     private static final int MAX_PUSH_ATTEMPTS = 6;
 
-    private final ConcurrentHashMap<DirtyChunk, Boolean> dirtyChunks = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<DirtyChunk, PendingPush> pendingPushes = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<DirtySection, Boolean> dirtySections = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<DirtySection, PendingPush> pendingPushes = new ConcurrentHashMap<>();
     private final ChunkVoxelizer voxelizer;
     private final LodStreamingService streamingService;
     private final int flushInterval;
     private int tickCounter = 0;
     private long currentTick = 0L;
 
-    private record DirtyChunk(Identifier dimension, int chunkX, int chunkZ) {}
+    private record DirtySection(Identifier dimension, int chunkX, int sectionY, int chunkZ) {}
     private record PendingPush(int nextTick, int attemptsLeft) {}
 
     public DirtyTracker(ChunkVoxelizer voxelizer, LodStreamingService streamingService, int flushInterval) {
@@ -32,11 +32,12 @@ public class DirtyTracker {
         this.flushInterval = flushInterval;
     }
 
-    public void markDirty(ServerLevel level, int chunkX, int chunkZ) {
+    public void markDirty(ServerLevel level, int chunkX, int blockY, int chunkZ) {
         Identifier dim = level.dimension().identifier();
-        DirtyChunk dirtyChunk = new DirtyChunk(dim, chunkX, chunkZ);
-        dirtyChunks.put(dirtyChunk, Boolean.TRUE);
-        pendingPushes.remove(dirtyChunk);
+        int sectionY = blockY >> 5;
+        DirtySection dirtySection = new DirtySection(dim, chunkX, sectionY, chunkZ);
+        dirtySections.put(dirtySection, Boolean.TRUE);
+        pendingPushes.remove(dirtySection);
     }
 
     public void tick(MinecraftServer server) {
@@ -46,60 +47,68 @@ public class DirtyTracker {
         if (++tickCounter < flushInterval) return;
         tickCounter = 0;
 
-        if (dirtyChunks.isEmpty()) return;
+        if (dirtySections.isEmpty()) return;
 
         // drain all dirty chunks
-        Set<DirtyChunk> toProcess = ConcurrentHashMap.newKeySet();
-        var iter = dirtyChunks.keySet().iterator();
+        Set<DirtySection> toProcess = ConcurrentHashMap.newKeySet();
+        var iter = dirtySections.keySet().iterator();
         while (iter.hasNext()) {
             toProcess.add(iter.next());
             iter.remove();
         }
 
-        for (DirtyChunk dc : toProcess) {
-            ServerLevel level = findLevel(server, dc.dimension);
+        record ChunkPosDim(Identifier dimension, int chunkX, int chunkZ) {}
+        Set<ChunkPosDim> revoxelized = new java.util.HashSet<>();
+
+        for (DirtySection ds : toProcess) {
+            ServerLevel level = findLevel(server, ds.dimension);
             if (level == null) continue;
 
-            LevelChunk chunk = level.getChunkSource().getChunkNow(dc.chunkX, dc.chunkZ);
-            if (chunk == null) continue;
+            ChunkPosDim cpd = new ChunkPosDim(ds.dimension, ds.chunkX, ds.chunkZ);
+            if (!revoxelized.contains(cpd)) {
+                LevelChunk chunk = level.getChunkSource().getChunkNow(ds.chunkX, ds.chunkZ);
+                if (chunk != null) {
+                    voxelizer.revoxelizeChunk(level, chunk);
+                }
+                revoxelized.add(cpd);
+            }
 
-            voxelizer.revoxelizeChunk(level, chunk);
-            pendingPushes.put(dc, new PendingPush((int) (currentTick + PUSH_DELAY_TICKS), MAX_PUSH_ATTEMPTS));
+            pendingPushes.put(ds, new PendingPush((int) (currentTick + PUSH_DELAY_TICKS), MAX_PUSH_ATTEMPTS));
         }
     }
 
     private void flushPendingPushes(MinecraftServer server) {
         if (pendingPushes.isEmpty()) return;
 
-        Set<DirtyChunk> ready = ConcurrentHashMap.newKeySet();
+        Set<DirtySection> ready = ConcurrentHashMap.newKeySet();
         for (var entry : pendingPushes.entrySet()) {
             if (entry.getValue().nextTick <= currentTick) {
                 ready.add(entry.getKey());
             }
         }
 
-        for (DirtyChunk dc : ready) {
-            PendingPush pending = pendingPushes.get(dc);
+        for (DirtySection ds : ready) {
+            PendingPush pending = pendingPushes.get(ds);
             if (pending == null || pending.nextTick > currentTick) continue;
 
-            ServerLevel level = findLevel(server, dc.dimension);
+            ServerLevel level = findLevel(server, ds.dimension);
             if (level == null) {
-                pendingPushes.remove(dc, pending);
+                pendingPushes.remove(ds, pending);
                 continue;
             }
 
-            LevelChunk chunk = level.getChunkSource().getChunkNow(dc.chunkX, dc.chunkZ);
+            LevelChunk chunk = level.getChunkSource().getChunkNow(ds.chunkX, ds.chunkZ);
             if (chunk == null) {
-                pendingPushes.remove(dc, pending);
+                pendingPushes.remove(ds, pending);
                 continue;
             }
 
-            streamingService.onChunkDirty(server, level, dc.chunkX, dc.chunkZ);
+            streamingService.onSectionDirty(server, level, ds.chunkX, ds.sectionY, ds.chunkZ);
 
             if (pending.attemptsLeft <= 1) {
-                pendingPushes.remove(dc, pending);
+                pendingPushes.remove(ds, pending);
             } else {
-                pendingPushes.replace(dc, pending, new PendingPush((int) (currentTick + PUSH_DELAY_TICKS), pending.attemptsLeft - 1));
+                pendingPushes.replace(ds, pending, new PendingPush((int) (currentTick + PUSH_DELAY_TICKS), pending.attemptsLeft - 1));
             }
         }
     }

@@ -150,11 +150,9 @@ public class LodStreamingService {
     }
 
     // push updated sections for a dirty chunk to all players who already have it
-    public void onChunkDirty(MinecraftServer server, ServerLevel level, int chunkX, int chunkZ) {
+    public void onSectionDirty(MinecraftServer server, ServerLevel level, int chunkX, int sectionY, int chunkZ) {
         int worldSecX = chunkX >> 1;
         int worldSecZ = chunkZ >> 1;
-        int minY = level.getMinSectionY() >> 1;
-        int maxY = (level.getMaxSectionY() >> 1) + 1;
 
         WorldIdentifier worldId = WorldIdentifier.of(level);
         if (worldId == null) return;
@@ -167,37 +165,35 @@ public class LodStreamingService {
             if (world == null) return;
             Mapper mapper = world.getMapper();
 
-            for (int secY = minY; secY < maxY; secY++) {
-                long key = WorldEngine.getWorldSectionId(0, worldSecX, secY, worldSecZ);
-                WorldSection section = world.acquireIfExists(0, worldSecX, secY, worldSecZ);
-                if (section == null) continue;
+            long key = WorldEngine.getWorldSectionId(0, worldSecX, sectionY, worldSecZ);
+            WorldSection section = world.acquireIfExists(0, worldSecX, sectionY, worldSecZ);
+            if (section == null) return;
 
-                LODSectionPayload payload;
-                try {
-                    payload = serializeSection(section, dimension, mapper, biomeRegistry);
-                } finally {
-                    section.release();
+            LODSectionPayload payload;
+            try {
+                payload = serializeSection(section, dimension, mapper, biomeRegistry);
+            } finally {
+                section.release();
+            }
+            if (payload == null) return;
+
+            LODSectionPayload finalPayload = payload;
+            long sectionKey = key;
+            // send to all players who already received this section
+            for (var entry : trackers.entrySet()) {
+                PlayerLodTracker tracker = entry.getValue();
+                if (!tracker.isReady() || !tracker.hasSent(sectionKey)) continue;
+
+                UUID playerId = entry.getKey();
+                if (com.dripps.voxyserver.util.ServerStatsTracker.INSTANCE != null) {
+                    com.dripps.voxyserver.util.ServerStatsTracker.INSTANCE.markStreamed();
                 }
-                if (payload == null) continue;
-
-                LODSectionPayload finalPayload = payload;
-                long sectionKey = key;
-                // send to all players who already received this section
-                for (var entry : trackers.entrySet()) {
-                    PlayerLodTracker tracker = entry.getValue();
-                    if (!tracker.isReady() || !tracker.hasSent(sectionKey)) continue;
-
-                    UUID playerId = entry.getKey();
-                    if (com.dripps.voxyserver.util.ServerStatsTracker.INSTANCE != null) {
-                        com.dripps.voxyserver.util.ServerStatsTracker.INSTANCE.markStreamed();
+                server.execute(() -> {
+                    ServerPlayer player = server.getPlayerList().getPlayer(playerId);
+                    if (player != null && player.level() == level) {
+                        ServerPlayNetworking.send(player, finalPayload);
                     }
-                    server.execute(() -> {
-                        ServerPlayer player = server.getPlayerList().getPlayer(playerId);
-                        if (player != null && player.level() == level) {
-                            ServerPlayNetworking.send(player, finalPayload);
-                        }
-                    });
-                }
+                });
             }
         });
     }
