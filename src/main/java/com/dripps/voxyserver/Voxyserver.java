@@ -42,6 +42,11 @@ public class Voxyserver implements ModInitializer {
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) ->
                 VoxyServerCommands.register(dispatcher, () -> importCoordinator));
         ServerLifecycleEvents.SERVER_STARTED.register(server -> {
+            if (!server.isDedicatedServer()) {
+                LOGGER.info("disabledi in sp");
+                return;
+            }
+
             var worldPath = server.getWorldPath(LevelResource.ROOT);
             lodEngine = new ServerLodEngine(worldPath);
             chunkVoxelizer = new ChunkVoxelizer(lodEngine, config);
