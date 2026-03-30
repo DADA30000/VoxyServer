@@ -90,6 +90,7 @@ config file is generated at `config/voxyserver.json` on first run.
 |--------|---------|-------------|
 | `lodStreamRadius` | `256` | radius in chunks to stream LODs around each player |
 | `maxSectionsPerTickPerPlayer` | `10` | max LOD sections sent per player per tick cycle |
+| `sectionsPerPacket` | `50` | max LOD sections bundled into a single network packet |
 | `tickInterval` | `5` | server ticks between each streaming cycle |
 | `generateOnChunkLoad` | `true` | voxelize chunks as they load on the server |
 | `dirtyTrackingEnabled` | `true` | revoxelize and push LODs when blocks change |
@@ -103,6 +104,7 @@ config file is generated at `config/voxyserver.json` on first run.
 {
   "lodStreamRadius": 256,
   "maxSectionsPerTickPerPlayer": 10,
+  "sectionsPerPacket": 50,
   "generateOnChunkLoad": true,
   "tickInterval": 5,
   "dirtyTrackingEnabled": true,
@@ -112,7 +114,19 @@ config file is generated at `config/voxyserver.json` on first run.
 }
 ```
 
-higher `lodStreamRadius` means more LOD coverage but more storage and bandwidth. `maxSectionsPerTickPerPlayer` controls how fast LODs are sent to new players or when moving into unexplored areas. lower `tickInterval` = more frequent streaming checks.
+higher `lodStreamRadius` means more LOD coverage but more storage and bandwidth. `maxSectionsPerTickPerPlayer` controls how fast LODs are sent to new players or when moving into unexplored areas. `sectionsPerPacket` controls how many sections are packed into each network packet (higher = fewer packets but larger each). lower `tickInterval` = more frequent streaming checks.
+
+### client config
+
+if the client has [ModMenu](https://modrinth.com/mod/modmenu) and [Cloth Config](https://modrinth.com/mod/cloth-config) installed, players can open the voxyserver config screen from the mods list to adjust their personal streaming preferences:
+
+| option | description |
+|--------|-------------|
+| **Enable LOD Streaming** | toggle whether the server sends LOD data to you |
+| **LOD Stream Radius** | personal LOD radius in blocks, 0 = use server default |
+| **Max Sections Per Tick** | personal rate limit for sections sent per tick, 0 = use server default |
+
+these values are capped at the server's configured maximums and sent to the server automatically when saved.
 
 ## commands
 
