@@ -24,17 +24,30 @@ public record LODBulkPayload(
         buf.writeIdentifier(payload.dimension);
         buf.writeVarInt(payload.sections.size());
         for (LODSectionPayload section : payload.sections) {
-            // write each section inline without redundant dimension
             buf.writeLong(section.sectionKey());
-            buf.writeVarInt(section.lutBlockStateIds().length);
-            for (int i = 0; i < section.lutBlockStateIds().length; i++) {
+            int lutLen = section.lutBlockStateIds().length;
+            buf.writeVarInt(lutLen);
+            for (int i = 0; i < lutLen; i++) {
                 buf.writeVarInt(section.lutBlockStateIds()[i]);
                 buf.writeVarInt(section.lutBiomeIds()[i]);
                 buf.writeByte(section.lutLight()[i]);
             }
-            buf.writeVarInt(section.indexArray().length);
-            for (short idx : section.indexArray()) {
-                buf.writeShort(idx);
+
+            // pack indices at minimum bit width for lut size
+            short[] indexArray = section.indexArray();
+            int bitsPerEntry = Math.max(1, 32 - Integer.numberOfLeadingZeros(Math.max(lutLen - 1, 0)));
+            int entriesPerLong = 64 / bitsPerEntry;
+            int longCount = (indexArray.length + entriesPerLong - 1) / entriesPerLong;
+
+            buf.writeVarInt(indexArray.length);
+            buf.writeByte(bitsPerEntry);
+            for (int li = 0; li < longCount; li++) {
+                long packed = 0L;
+                int base = li * entriesPerLong;
+                for (int ei = 0; ei < entriesPerLong && base + ei < indexArray.length; ei++) {
+                    packed |= ((long) (indexArray[base + ei] & 0xFFFF)) << (ei * bitsPerEntry);
+                }
+                buf.writeLong(packed);
             }
         }
     }
@@ -55,9 +68,16 @@ public record LODBulkPayload(
                 light[i] = buf.readByte();
             }
             int indexLen = buf.readVarInt();
+            int bitsPerEntry = buf.readByte() & 0xFF;
+            int entriesPerLong = 64 / bitsPerEntry;
+            long mask = (1L << bitsPerEntry) - 1;
             short[] indexArray = new short[indexLen];
-            for (int i = 0; i < indexLen; i++) {
-                indexArray[i] = buf.readShort();
+            int idx = 0;
+            while (idx < indexLen) {
+                long packed = buf.readLong();
+                for (int ei = 0; ei < entriesPerLong && idx < indexLen; ei++, idx++) {
+                    indexArray[idx] = (short) ((packed >> (ei * bitsPerEntry)) & mask);
+                }
             }
             sections.add(new LODSectionPayload(dimension, sectionKey, blockStateIds, biomeIds, light, indexArray));
         }

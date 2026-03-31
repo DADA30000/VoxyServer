@@ -26,16 +26,28 @@ public record LODSectionPayload(
         buf.writeIdentifier(payload.dimension);
         buf.writeLong(payload.sectionKey);
 
-        buf.writeVarInt(payload.lutBlockStateIds.length);
-        for (int i = 0; i < payload.lutBlockStateIds.length; i++) {
+        int lutLen = payload.lutBlockStateIds.length;
+        buf.writeVarInt(lutLen);
+        for (int i = 0; i < lutLen; i++) {
             buf.writeVarInt(payload.lutBlockStateIds[i]);
             buf.writeVarInt(payload.lutBiomeIds[i]);
             buf.writeByte(payload.lutLight[i]);
         }
 
+        // pack indices at minimum bit width for lut size
+        int bitsPerEntry = Math.max(1, 32 - Integer.numberOfLeadingZeros(Math.max(lutLen - 1, 0)));
+        int entriesPerLong = 64 / bitsPerEntry;
+        int longCount = (payload.indexArray.length + entriesPerLong - 1) / entriesPerLong;
+
         buf.writeVarInt(payload.indexArray.length);
-        for (short idx : payload.indexArray) {
-            buf.writeShort(idx);
+        buf.writeByte(bitsPerEntry);
+        for (int li = 0; li < longCount; li++) {
+            long packed = 0L;
+            int base = li * entriesPerLong;
+            for (int ei = 0; ei < entriesPerLong && base + ei < payload.indexArray.length; ei++) {
+                packed |= ((long) (payload.indexArray[base + ei] & 0xFFFF)) << (ei * bitsPerEntry);
+            }
+            buf.writeLong(packed);
         }
     }
 
@@ -54,9 +66,16 @@ public record LODSectionPayload(
         }
 
         int indexLen = buf.readVarInt();
+        int bitsPerEntry = buf.readByte() & 0xFF;
+        int entriesPerLong = 64 / bitsPerEntry;
+        long mask = (1L << bitsPerEntry) - 1;
         short[] indexArray = new short[indexLen];
-        for (int i = 0; i < indexLen; i++) {
-            indexArray[i] = buf.readShort();
+        int idx = 0;
+        while (idx < indexLen) {
+            long packed = buf.readLong();
+            for (int ei = 0; ei < entriesPerLong && idx < indexLen; ei++, idx++) {
+                indexArray[idx] = (short) ((packed >> (ei * bitsPerEntry)) & mask);
+            }
         }
 
         return new LODSectionPayload(dimension, sectionKey, blockStateIds, biomeIds, light, indexArray);
