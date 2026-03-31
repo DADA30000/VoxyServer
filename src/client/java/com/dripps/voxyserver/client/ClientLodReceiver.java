@@ -5,6 +5,7 @@ import com.dripps.voxyserver.network.LODClearPayload;
 import com.dripps.voxyserver.network.LODReadyPayload;
 import com.dripps.voxyserver.network.LODSectionPayload;
 import com.dripps.voxyserver.network.LODServerSettingsPayload;
+import com.dripps.voxyserver.network.PreSerializedLodPayload;
 import me.cortex.voxy.common.voxelization.VoxelizedSection;
 import me.cortex.voxy.common.voxelization.WorldConversionFactory;
 import me.cortex.voxy.common.world.WorldEngine;
@@ -42,13 +43,12 @@ public class ClientLodReceiver {
                     payload.maxLodStreamRadius(), payload.maxSectionsPerTick()));
         });
 
-        ClientPlayNetworking.registerGlobalReceiver(LODSectionPayload.TYPE, (payload, context) -> {
-            context.client().execute(() -> handleSection(payload));
-        });
-
-        ClientPlayNetworking.registerGlobalReceiver(LODBulkPayload.TYPE, (payload, context) -> {
+        ClientPlayNetworking.registerGlobalReceiver(PreSerializedLodPayload.TYPE, (payload, context) -> {
             context.client().execute(() -> {
-                for (LODSectionPayload section : payload.sections()) {
+                ClientLevel level = Minecraft.getInstance().level;
+                if (level == null) return;
+                LODBulkPayload bulk = payload.decodeBulk(level.registryAccess());
+                for (LODSectionPayload section : bulk.sections()) {
                     handleSection(section);
                 }
             });

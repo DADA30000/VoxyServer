@@ -7,6 +7,7 @@ import com.dripps.voxyserver.network.LODPreferencesPayload;
 import com.dripps.voxyserver.network.LODReadyPayload;
 import com.dripps.voxyserver.network.LODSectionPayload;
 import com.dripps.voxyserver.network.LODServerSettingsPayload;
+import com.dripps.voxyserver.network.PreSerializedLodPayload;
 import com.dripps.voxyserver.util.IdRemapper;
 import it.unimi.dsi.fastutil.longs.Long2ShortOpenHashMap;
 import me.cortex.voxy.common.world.WorldEngine;
@@ -45,12 +46,13 @@ public class LodStreamingService {
     private final int sectionsPerPacket;
     private final int tickInterval;
     private final long pendingDirtyTimeoutTicks;
+    private final DimensionOrdinals dimOrdinals = new DimensionOrdinals();
     private final ConcurrentHashMap<UUID, PlayerLodTracker> trackers = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<SectionRef, Integer> sectionVersions = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<SectionRef, Long> pendingDirtySections = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<SectionRef, Long> initialLoadSections = new ConcurrentHashMap<>();
-    private final Set<ChunkRef> loadedChunks = ConcurrentHashMap.newKeySet();
-    private final Set<SectionRef> queuedDirtySections = ConcurrentHashMap.newKeySet();
+    private final ConcurrentHashMap<Long, Integer> sectionVersions = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, Long> pendingDirtySections = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<Long, Long> initialLoadSections = new ConcurrentHashMap<>();
+    private final Set<Long> loadedChunks = ConcurrentHashMap.newKeySet();
+    private final Set<Long> queuedDirtySections = ConcurrentHashMap.newKeySet();
     private final AtomicReference<SnapshotBatch> pendingSnapshotBatch = new AtomicReference<>();
     private final AtomicBoolean streamWorkerScheduled = new AtomicBoolean();
     private final ExecutorService streamExecutor = Executors.newSingleThreadExecutor(r -> {
@@ -62,9 +64,54 @@ public class LodStreamingService {
     private int tickCounter = 0;
     private volatile long currentTick = 0L;
 
-    private record SectionRef(Identifier dimension, long sectionKey) {}
-    private record ChunkRef(Identifier dimension, int chunkX, int chunkZ) {}
+    // biome id -> vanilla registry id cache per mapper, only accessed from stream thread
+    private final IdentityHashMap<Mapper, int[]> biomeIdCaches = new IdentityHashMap<>();
+
     private record SnapshotBatch(MinecraftServer server, List<PlayerSnapshot> snapshots) {}
+
+    private static final class DimensionOrdinals {
+        private final ConcurrentHashMap<Identifier, Integer> dimToOrdinal = new ConcurrentHashMap<>();
+        private volatile Identifier[] ordinalToDim = new Identifier[0];
+
+        int getOrdinal(Identifier dim) {
+            Integer ord = dimToOrdinal.get(dim);
+            if (ord != null) return ord;
+            return register(dim);
+        }
+
+        private synchronized int register(Identifier dim) {
+            Integer ord = dimToOrdinal.get(dim);
+            if (ord != null) return ord;
+            int o = ordinalToDim.length;
+            if (o >= 16) throw new IllegalStateException("too many dimensions for key encoding (max 16)");
+            Identifier[] newArr = Arrays.copyOf(ordinalToDim, o + 1);
+            newArr[o] = dim;
+            ordinalToDim = newArr;
+            dimToOrdinal.put(dim, o);
+            return o;
+        }
+
+        Identifier getDimension(int ordinal) {
+            return ordinalToDim[ordinal];
+        }
+    }
+
+    // packs dimension ordinal into the unused level bits of a level 0 section key
+    private static long composeSectionKey(int dimOrdinal, long sectionKey) {
+        return sectionKey | ((long)(dimOrdinal & 0xF) << 60);
+    }
+
+    private static long extractSectionKey(long compositeKey) {
+        return compositeKey & 0x0FFFFFFFFFFFFFFFL;
+    }
+
+    private static int extractSectionDimOrdinal(long compositeKey) {
+        return (int)(compositeKey >>> 60) & 0xF;
+    }
+
+    private static long composeChunkKey(int dimOrdinal, int chunkX, int chunkZ) {
+        return ((long)(dimOrdinal & 0xFF) << 56) | ((long)(chunkX & 0x0FFFFFFF) << 28) | (chunkZ & 0x0FFFFFFFL);
+    }
 
     public LodStreamingService(ServerLodEngine engine, com.dripps.voxyserver.config.VoxyServerConfig config) {
         this.engine = engine;
@@ -116,32 +163,32 @@ public class LodStreamingService {
     public void markChunkPendingDirty(Identifier dimension, int chunkX, int sectionY, int chunkZ) {
         long key = WorldEngine.getWorldSectionId(0, chunkX >> 1, sectionY, chunkZ >> 1);
         long blockUntilTick = currentTick + pendingDirtyTimeoutTicks;
-        pendingDirtySections.put(new SectionRef(dimension, key), blockUntilTick);
+        pendingDirtySections.put(composeSectionKey(dimOrdinals.getOrdinal(dimension), key), blockUntilTick);
     }
 
     public void markChunkPendingInitialLoad(Identifier dimension, int chunkX, int sectionY, int chunkZ) {
         long key = WorldEngine.getWorldSectionId(0, chunkX >> 1, sectionY, chunkZ >> 1);
-        SectionRef ref = new SectionRef(dimension, key);
+        long compositeKey = composeSectionKey(dimOrdinals.getOrdinal(dimension), key);
         long blockUntilTick = currentTick + pendingDirtyTimeoutTicks;
-        pendingDirtySections.put(ref, blockUntilTick);
+        pendingDirtySections.put(compositeKey, blockUntilTick);
         long graceUntilTick = currentTick + INITIAL_LOAD_GRACE_TICKS;
-        initialLoadSections.compute(ref, (ignored, currentDeadline) ->
+        initialLoadSections.compute(compositeKey, (ignored, currentDeadline) ->
                 currentDeadline == null ? graceUntilTick : Math.max(currentDeadline, graceUntilTick));
     }
 
     public void clearChunkPendingDirty(Identifier dimension, int chunkX, int sectionY, int chunkZ) {
         long key = WorldEngine.getWorldSectionId(0, chunkX >> 1, sectionY, chunkZ >> 1);
-        SectionRef ref = new SectionRef(dimension, key);
-        pendingDirtySections.remove(ref);
-        initialLoadSections.remove(ref);
+        long compositeKey = composeSectionKey(dimOrdinals.getOrdinal(dimension), key);
+        pendingDirtySections.remove(compositeKey);
+        initialLoadSections.remove(compositeKey);
     }
 
     public void onChunkLoadStateChanged(Identifier dimension, int chunkX, int chunkZ, boolean loaded) {
-        ChunkRef ref = new ChunkRef(dimension, chunkX, chunkZ);
+        long chunkKey = composeChunkKey(dimOrdinals.getOrdinal(dimension), chunkX, chunkZ);
         if (loaded) {
-            loadedChunks.add(ref);
+            loadedChunks.add(chunkKey);
         } else {
-            loadedChunks.remove(ref);
+            loadedChunks.remove(chunkKey);
         }
     }
 
@@ -252,6 +299,7 @@ public class LodStreamingService {
         int radiusSections = effectiveRadius >> 1;
         Mapper mapper = world.getMapper();
         long scanTick = currentTick;
+        int dimOrd = dimOrdinals.getOrdinal(snap.dimension);
 
         if (!tracker.prepareScan(
                 playerWorldSecX,
@@ -274,9 +322,9 @@ public class LodStreamingService {
                 break;
             }
 
-            int version = getSectionVersion(snap.dimension, key);
+            int version = getSectionVersion(dimOrd, key);
             if (tracker.hasSent(key, version)) continue;
-            if (isSectionPendingDirty(snap.dimension, key)) continue;
+            if (isSectionPendingDirty(dimOrd, key)) continue;
 
             WorldSection section = world.acquireIfExists(key);
             if (section == null) continue;
@@ -297,17 +345,21 @@ public class LodStreamingService {
             List<LODSectionPayload> toSend = List.copyOf(batch);
             Identifier dim = snap.dimension;
             UUID playerId = snap.uuid;
+
+            // preserialize on stream thread so no heavy encoding on tick thread
+            List<PreSerializedLodPayload> packets = new ArrayList<>();
+            for (int i = 0; i < toSend.size(); i += sectionsPerPacket) {
+                List<LODSectionPayload> chunk = toSend.subList(i, Math.min(toSend.size(), i + sectionsPerPacket));
+                packets.add(PreSerializedLodPayload.fromBulk(new LODBulkPayload(dim, chunk), server.registryAccess()));
+            }
+            List<PreSerializedLodPayload> preEncoded = List.copyOf(packets);
+
             server.execute(() -> {
                 ServerPlayer player = server.getPlayerList().getPlayer(playerId);
                 if (player == null) return;
                 if (!player.level().dimension().identifier().equals(dim)) return;
-                for (int i = 0; i < toSend.size(); i += sectionsPerPacket) {
-                    List<LODSectionPayload> chunk = toSend.subList(i, Math.min(toSend.size(), i + sectionsPerPacket));
-                    if (chunk.size() == 1) {
-                        ServerPlayNetworking.send(player, chunk.getFirst());
-                    } else {
-                        ServerPlayNetworking.send(player, new LODBulkPayload(dim, chunk));
-                    }
+                for (PreSerializedLodPayload pkt : preEncoded) {
+                    ServerPlayNetworking.send(player, pkt);
                 }
             });
         }
@@ -341,11 +393,30 @@ public class LodStreamingService {
             long mappingId = entry.getLongKey();
             short idx = entry.getShortValue();
             lutBlockStateIds[idx] = IdRemapper.toVanillaBlockStateId(mapper, mappingId);
-            lutBiomeIds[idx] = IdRemapper.toVanillaBiomeIdFromMapper(mapper, mappingId, biomeRegistry);
+            lutBiomeIds[idx] = getCachedBiomeId(mapper, mappingId, biomeRegistry);
             lutLight[idx] = (byte) IdRemapper.getLightFromMapping(mappingId);
         }
 
         return new LODSectionPayload(dimension, section.key, lutBlockStateIds, lutBiomeIds, lutLight, indexArray);
+    }
+
+    private int getCachedBiomeId(Mapper mapper, long mappingId, Registry<Biome> biomeRegistry) {
+        int biomeId = Mapper.getBiomeId(mappingId);
+        int[] cache = biomeIdCaches.get(mapper);
+        if (cache != null && biomeId < cache.length && cache[biomeId] != -1) {
+            return cache[biomeId];
+        }
+        int vanillaId = IdRemapper.toVanillaBiomeIdFromMapper(mapper, mappingId, biomeRegistry);
+        if (cache == null || biomeId >= cache.length) {
+            int newLen = Math.max(biomeId + 1, cache == null ? 16 : cache.length * 2);
+            int[] newCache = new int[newLen];
+            Arrays.fill(newCache, -1);
+            if (cache != null) System.arraycopy(cache, 0, newCache, 0, cache.length);
+            cache = newCache;
+            biomeIdCaches.put(mapper, cache);
+        }
+        cache[biomeId] = vanillaId;
+        return vanillaId;
     }
 
     private void onWorldSectionDirty(Identifier dimension, long sectionKey) {
@@ -353,8 +424,8 @@ public class LodStreamingService {
             return;
         }
 
-        SectionRef ref = new SectionRef(dimension, sectionKey);
-        if (!pendingDirtySections.containsKey(ref)) {
+        long compositeKey = composeSectionKey(dimOrdinals.getOrdinal(dimension), sectionKey);
+        if (!pendingDirtySections.containsKey(compositeKey)) {
             return;
         }
 
@@ -363,33 +434,33 @@ public class LodStreamingService {
             return;
         }
 
-        Long initialLoadDeadline = initialLoadSections.get(ref);
-        if (initialLoadDeadline != null && !isInitialLoadReady(ref, initialLoadDeadline)) {
+        Long initialLoadDeadline = initialLoadSections.get(compositeKey);
+        if (initialLoadDeadline != null && !isInitialLoadReady(compositeKey, initialLoadDeadline)) {
             return;
         }
 
         try {
-            queuedDirtySections.add(ref);
+            queuedDirtySections.add(compositeKey);
             scheduleStreamWorker();
         } catch (RejectedExecutionException ignored) {
         }
     }
 
-    private void processDirtySection(MinecraftServer server, SectionRef ref) {
-        if (shouldDeferInitialLoad(ref)) {
+    private void processDirtySection(MinecraftServer server, long compositeKey) {
+        if (shouldDeferInitialLoad(compositeKey)) {
             return;
         }
 
-        if (pendingDirtySections.remove(ref) == null) {
+        if (pendingDirtySections.remove(compositeKey) == null) {
             return;
         }
 
-        initialLoadSections.remove(ref);
+        initialLoadSections.remove(compositeKey);
 
-        Identifier dimension = ref.dimension();
-        long sectionKey = ref.sectionKey();
+        Identifier dimension = dimOrdinals.getDimension(extractSectionDimOrdinal(compositeKey));
+        long sectionKey = extractSectionKey(compositeKey);
 
-        int version = sectionVersions.compute(ref, (ignored, currentVersion) -> {
+        int version = sectionVersions.compute(compositeKey, (ignored, currentVersion) -> {
             if (currentVersion == null || currentVersion == Integer.MAX_VALUE) {
                 return 1;
             }
@@ -430,7 +501,10 @@ public class LodStreamingService {
 
         int worldSecX = WorldEngine.getX(sectionKey);
         int worldSecZ = WorldEngine.getZ(sectionKey);
-        LODSectionPayload finalPayload = payload;
+
+        PreSerializedLodPayload preSerialized = PreSerializedLodPayload.fromBulk(
+                new LODBulkPayload(dimension, List.of(payload)), level.registryAccess());
+
         for (var entry : trackers.entrySet()) {
             PlayerLodTracker tracker = entry.getValue();
             if (!tracker.isReady() || !tracker.isLodEnabled()) {
@@ -455,19 +529,19 @@ public class LodStreamingService {
             server.execute(() -> {
                 ServerPlayer player = server.getPlayerList().getPlayer(playerId);
                 if (player != null && player.level() == level) {
-                    ServerPlayNetworking.send(player, finalPayload);
+                    ServerPlayNetworking.send(player, preSerialized);
                 }
             });
         }
     }
 
-    private boolean isSectionPendingDirty(Identifier dimension, long sectionKey) {
-        Long blockUntilTick = pendingDirtySections.get(new SectionRef(dimension, sectionKey));
+    private boolean isSectionPendingDirty(int dimOrdinal, long sectionKey) {
+        Long blockUntilTick = pendingDirtySections.get(composeSectionKey(dimOrdinal, sectionKey));
         return blockUntilTick != null && blockUntilTick > currentTick;
     }
 
-    private int getSectionVersion(Identifier dimension, long sectionKey) {
-        return sectionVersions.getOrDefault(new SectionRef(dimension, sectionKey), 0);
+    private int getSectionVersion(int dimOrdinal, long sectionKey) {
+        return sectionVersions.getOrDefault(composeSectionKey(dimOrdinal, sectionKey), 0);
     }
 
     private void expirePendingDirtySections() {
@@ -515,28 +589,30 @@ public class LodStreamingService {
         }
 
         for (var entry : initialLoadSections.entrySet()) {
-            SectionRef ref = entry.getKey();
+            Long compositeKey = entry.getKey();
             long deadline = entry.getValue();
-            int loadedChunkCount = loadedChunkCountForSection(ref.dimension(), ref.sectionKey());
+            int dimOrd = extractSectionDimOrdinal(compositeKey);
+            long sectionKey = extractSectionKey(compositeKey);
+            int loadedChunkCount = loadedChunkCountForSection(dimOrd, sectionKey);
             boolean readyByFootprint = loadedChunkCount == 4;
             boolean readyByDeadline = currentTick >= deadline && loadedChunkCount >= INITIAL_LOAD_MIN_CHUNKS_AT_DEADLINE;
             if (!readyByDeadline && !readyByFootprint) {
                 continue;
             }
 
-            if (!initialLoadSections.remove(ref, deadline)) {
+            if (!initialLoadSections.remove(compositeKey, deadline)) {
                 continue;
             }
 
             // remove pending gate immediately so the snapshot scan can reach this section
             // without waiting for the dirty queue (which may be backed up behind thousands
             // of dirty callbacks and cause the pending entry to expire before processing)
-            if (pendingDirtySections.remove(ref) == null) {
+            if (pendingDirtySections.remove(compositeKey) == null) {
                 continue;
             }
 
             // bump version so hasSent() returns false and the scanner resends
-            sectionVersions.compute(ref, (ignored, currentVersion) -> {
+            sectionVersions.compute(compositeKey, (ignored, currentVersion) -> {
                 if (currentVersion == null || currentVersion == Integer.MAX_VALUE) {
                     return 1;
                 }
@@ -587,29 +663,31 @@ public class LodStreamingService {
 
         int drained = 0;
         while (!queuedDirtySections.isEmpty() && drained < maxSections) {
-            Iterator<SectionRef> iterator = queuedDirtySections.iterator();
+            Iterator<Long> iterator = queuedDirtySections.iterator();
             if (!iterator.hasNext()) {
                 return drained;
             }
 
-            SectionRef ref = iterator.next();
-            if (!queuedDirtySections.remove(ref)) {
+            Long compositeKey = iterator.next();
+            if (!queuedDirtySections.remove(compositeKey)) {
                 continue;
             }
 
-            processDirtySection(server, ref);
+            processDirtySection(server, compositeKey);
             drained++;
         }
         return drained;
     }
 
-    private boolean shouldDeferInitialLoad(SectionRef ref) {
-        Long deadline = initialLoadSections.get(ref);
+    private boolean shouldDeferInitialLoad(long compositeKey) {
+        Long deadline = initialLoadSections.get(compositeKey);
         if (deadline == null) {
             return false;
         }
 
-        int loadedChunkCount = loadedChunkCountForSection(ref.dimension(), ref.sectionKey());
+        int dimOrd = extractSectionDimOrdinal(compositeKey);
+        long sectionKey = extractSectionKey(compositeKey);
+        int loadedChunkCount = loadedChunkCountForSection(dimOrd, sectionKey);
         if (isInitialLoadReady(deadline, loadedChunkCount)) {
             return false;
         }
@@ -617,8 +695,10 @@ public class LodStreamingService {
         return true;
     }
 
-    private boolean isInitialLoadReady(SectionRef ref, long deadline) {
-        return isInitialLoadReady(deadline, loadedChunkCountForSection(ref.dimension(), ref.sectionKey()));
+    private boolean isInitialLoadReady(long compositeKey, long deadline) {
+        int dimOrd = extractSectionDimOrdinal(compositeKey);
+        long sectionKey = extractSectionKey(compositeKey);
+        return isInitialLoadReady(deadline, loadedChunkCountForSection(dimOrd, sectionKey));
     }
 
     private boolean isInitialLoadReady(long deadline, int loadedChunkCount) {
@@ -626,22 +706,14 @@ public class LodStreamingService {
                 || (currentTick >= deadline && loadedChunkCount >= INITIAL_LOAD_MIN_CHUNKS_AT_DEADLINE);
     }
 
-    private int loadedChunkCountForSection(Identifier dimension, long sectionKey) {
+    private int loadedChunkCountForSection(int dimOrdinal, long sectionKey) {
         int baseChunkX = WorldEngine.getX(sectionKey) << 1;
         int baseChunkZ = WorldEngine.getZ(sectionKey) << 1;
         int loaded = 0;
-        if (loadedChunks.contains(new ChunkRef(dimension, baseChunkX, baseChunkZ))) {
-            loaded++;
-        }
-        if (loadedChunks.contains(new ChunkRef(dimension, baseChunkX + 1, baseChunkZ))) {
-            loaded++;
-        }
-        if (loadedChunks.contains(new ChunkRef(dimension, baseChunkX, baseChunkZ + 1))) {
-            loaded++;
-        }
-        if (loadedChunks.contains(new ChunkRef(dimension, baseChunkX + 1, baseChunkZ + 1))) {
-            loaded++;
-        }
+        if (loadedChunks.contains(composeChunkKey(dimOrdinal, baseChunkX, baseChunkZ))) loaded++;
+        if (loadedChunks.contains(composeChunkKey(dimOrdinal, baseChunkX + 1, baseChunkZ))) loaded++;
+        if (loadedChunks.contains(composeChunkKey(dimOrdinal, baseChunkX, baseChunkZ + 1))) loaded++;
+        if (loadedChunks.contains(composeChunkKey(dimOrdinal, baseChunkX + 1, baseChunkZ + 1))) loaded++;
         return loaded;
     }
 }

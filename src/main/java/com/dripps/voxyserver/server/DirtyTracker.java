@@ -35,10 +35,14 @@ public class DirtyTracker {
     }
 
     public void tick(MinecraftServer server) {
-        if (++tickCounter < flushInterval) return;
+        if (++tickCounter < flushInterval) {
+            return;
+        }
         tickCounter = 0;
 
-        if (dirtySections.isEmpty()) return;
+        if (dirtySections.isEmpty()) {
+            return;
+        }
 
         Set<DirtySection> toProcess = ConcurrentHashMap.newKeySet();
         var iter = dirtySections.keySet().iterator();
