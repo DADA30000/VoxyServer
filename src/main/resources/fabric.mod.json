@@ -4,10 +4,14 @@
   "version": "${version}",
   "name": "VoxyServer",
   "description": "",
-  "authors": [],
-  "contact": {},
+  "authors": ["dripps"],
+  "contact": {
+    "homepage": "https://modrinth.com/mod/voxyserver",
+    "issues": "https://github.com/poosmacker/voxyserver/issues",
+    "sources": "https://github.com/poosmacker/voxyserver"
+  },
   "license": "GPL-3.0",
-  "icon": "assets/voxyserver/icon.png",
+  "icon": "assets/icon.png",
   "environment": "*",
   "entrypoints": {
     "fabric-datagen": [
@@ -39,5 +43,14 @@
     "voxy": "*",
     "modmenu": "*",
     "cloth-config": "*"
+  },
+  "custom": {
+    "modmenu": {
+      "links": {
+        "modmenu.discord": "https://discord.gg/fKQqFjNP2W",
+        "modmenu.modrinth": "https://modrinth.com/mod/voxyserver"
+      },
+      "update_checker": false
+    }
   }
 }
