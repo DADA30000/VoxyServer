@@ -55,17 +55,19 @@ public class LodStreamingService {
     private final Set<Long> queuedDirtySections = ConcurrentHashMap.newKeySet();
     private final AtomicReference<SnapshotBatch> pendingSnapshotBatch = new AtomicReference<>();
     private final AtomicBoolean streamWorkerScheduled = new AtomicBoolean();
-    private final ExecutorService streamExecutor = Executors.newSingleThreadExecutor(r -> {
-        Thread t = new Thread(r, "VoxyServer Streaming");
-        t.setDaemon(true);
-        return t;
-    });
+    private volatile ExecutorService streamExecutor = createStreamExecutor();
     private volatile MinecraftServer server;
     private int tickCounter = 0;
     private volatile long currentTick = 0L;
 
     // biome id -> vanilla registry id cache per mapper, only accessed from stream thread
     private final IdentityHashMap<Mapper, int[]> biomeIdCaches = new IdentityHashMap<>();
+
+    // we try to recover from voxy state corruption as best we can but the fix is rlly in voxy, all i can do for now.
+    private final Set<Identifier> corruptedDimensions = ConcurrentHashMap.newKeySet();
+    private volatile long lastStreamHeartbeat = System.nanoTime();
+    private volatile Identifier currentStreamDimension;
+    private static final long STREAM_WORKER_STUCK_NANOS = TimeUnit.SECONDS.toNanos(30);
 
     private record SnapshotBatch(MinecraftServer server, List<PlayerSnapshot> snapshots) {}
 
@@ -212,6 +214,7 @@ public class LodStreamingService {
         currentTick++;
         flushReadyInitialLoadSections();
         expirePendingDirtySections();
+        checkStreamWorkerHealth();
 
         if (++tickCounter < tickInterval) return;
         tickCounter = 0;
@@ -246,6 +249,7 @@ public class LodStreamingService {
 
     private void processSnapshots(MinecraftServer server, List<PlayerSnapshot> snapshots) {
         for (PlayerSnapshot snap : snapshots) {
+            lastStreamHeartbeat = System.nanoTime();
             drainQueuedDirtySections(server, MAX_DIRTY_SECTIONS_PER_DRAIN / 2);
 
             var tracker = trackers.get(snap.uuid);
@@ -288,6 +292,8 @@ public class LodStreamingService {
     }
 
     private void streamForSnapshot(MinecraftServer server, PlayerSnapshot snap, PlayerLodTracker tracker) {
+        if (corruptedDimensions.contains(snap.dimension)) return;
+        currentStreamDimension = snap.dimension;
         WorldEngine world = engine.getOrCreate(snap.worldId, snap.dimension);
         if (world == null) return;
 
@@ -329,6 +335,7 @@ public class LodStreamingService {
             WorldSection section = world.acquireIfExists(key);
             if (section == null) continue;
 
+            boolean sectionCorrupted = false;
             try {
                 LODSectionPayload payload = serializeSection(section, snap.dimension, mapper, snap.biomeRegistry);
                 if (payload != null) {
@@ -337,8 +344,14 @@ public class LodStreamingService {
                 }
                 tracker.markSent(key, version);
             } finally {
-                section.release();
+                try {
+                    section.release();
+                } catch (IllegalStateException e) {
+                    handleVoxyCorruption(snap.dimension, "streamForSnapshot section.release()", e);
+                    sectionCorrupted = true;
+                }
             }
+            if (sectionCorrupted) break;
         }
 
         if (!batch.isEmpty()) {
@@ -474,6 +487,8 @@ public class LodStreamingService {
     }
 
     private void pushDirtySection(MinecraftServer server, ServerLevel level, Identifier dimension, long sectionKey, int version) {
+        if (corruptedDimensions.contains(dimension)) return;
+        currentStreamDimension = dimension;
         WorldIdentifier worldId = WorldIdentifier.of(level);
         if (worldId == null) {
             return;
@@ -489,13 +504,19 @@ public class LodStreamingService {
         if (section == null) return;
 
         Registry<Biome> biomeRegistry = level.registryAccess().lookupOrThrow(Registries.BIOME);
+        boolean sectionCorrupted = false;
         LODSectionPayload payload;
         try {
             payload = serializeSection(section, dimension, mapper, biomeRegistry);
         } finally {
-            section.release();
+            try {
+                section.release();
+            } catch (IllegalStateException e) {
+                handleVoxyCorruption(dimension, "pushDirtySection section.release()", e);
+                sectionCorrupted = true;
+            }
         }
-        if (payload == null) {
+        if (sectionCorrupted || payload == null) {
             return;
         }
 
@@ -636,6 +657,7 @@ public class LodStreamingService {
     private void runStreamWorker() {
         try {
             while (true) {
+                lastStreamHeartbeat = System.nanoTime();
                 boolean didWork = drainQueuedDirtySections(server, MAX_DIRTY_SECTIONS_PER_DRAIN) > 0;
 
                 SnapshotBatch snapshotBatch = pendingSnapshotBatch.getAndSet(null);
@@ -649,10 +671,65 @@ public class LodStreamingService {
                 }
             }
         } finally {
+            lastStreamHeartbeat = System.nanoTime();
+            currentStreamDimension = null;
             streamWorkerScheduled.set(false);
             if (!queuedDirtySections.isEmpty() || pendingSnapshotBatch.get() != null) {
                 scheduleStreamWorker();
             }
+        }
+    }
+
+    private static ExecutorService createStreamExecutor() {
+        return Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "VoxyServer Streaming");
+            t.setDaemon(true);
+            return t;
+        });
+    }
+
+    private void checkStreamWorkerHealth() {
+        if (!streamWorkerScheduled.get()) {
+            lastStreamHeartbeat = System.nanoTime();
+            return;
+        }
+        long elapsed = System.nanoTime() - lastStreamHeartbeat;
+        if (elapsed > STREAM_WORKER_STUCK_NANOS) {
+            Identifier dim = currentStreamDimension;
+            if (dim != null) {
+                handleVoxyCorruption(dim, "stuck stream worker (no heartbeat for "
+                        + TimeUnit.NANOSECONDS.toSeconds(elapsed) + "s)", null);
+            }
+            Voxyserver.LOGGER.error(
+                    "[VoxyServer] stream worker unresponsive for {}s, prolly blocked on a leaked Voxy StampedLock. "
+                            + "replacing stream executor. a daemon thread has been leaked.",
+                    TimeUnit.NANOSECONDS.toSeconds(elapsed));
+
+            ExecutorService oldExecutor = streamExecutor;
+            streamExecutor = createStreamExecutor();
+            lastStreamHeartbeat = System.nanoTime();
+            currentStreamDimension = null;
+            streamWorkerScheduled.set(false);
+            oldExecutor.shutdownNow();
+
+            if (!queuedDirtySections.isEmpty() || pendingSnapshotBatch.get() != null) {
+                scheduleStreamWorker();
+            }
+        }
+    }
+
+    private void handleVoxyCorruption(Identifier dimension, String context, Exception e) {
+        if (!corruptedDimensions.add(dimension)) return;
+        if (e != null) {
+            Voxyserver.LOGGER.error(
+                    "[VoxyServer] Voxy state corruption :/ ({}) for dimension '{}'. "
+                            + "lod streaming disabled for this dimension until server restart.",
+                    context, dimension, e);
+        } else {
+            Voxyserver.LOGGER.error(
+                    "[VoxyServer] Voxy state corruption :/ ({}) for dimension '{}'. "
+                            + "lod streaming disabled for this dimension until server restart.",
+                    context, dimension);
         }
     }
 
