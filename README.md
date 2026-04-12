@@ -92,6 +92,7 @@ config file is generated at `config/voxyserver.json` on first run.
 | `maxSectionsPerTickPerPlayer` | `10` | max LOD sections sent per player per tick cycle |
 | `sectionsPerPacket` | `50` | max LOD sections bundled into a single network packet |
 | `tickInterval` | `5` | server ticks between each streaming cycle |
+| `workerThreads` | `3` | number of worker threads for voxy to use |
 | `generateOnChunkLoad` | `true` | voxelize chunks as they load on the server |
 | `dirtyTrackingEnabled` | `true` | revoxelize and push LODs when blocks change |
 | `dirtyTrackingInterval` | `40` | ticks between dirty chunk flushes (40 = 2 seconds) |
@@ -107,6 +108,7 @@ config file is generated at `config/voxyserver.json` on first run.
   "sectionsPerPacket": 50,
   "generateOnChunkLoad": true,
   "tickInterval": 5,
+  "workerThreads": 3,
   "dirtyTrackingEnabled": true,
   "dirtyTrackingInterval": 40,
   "debugTrackingEnabled": false,
